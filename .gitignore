@@ -1,0 +1,7 @@
+CLAUDE.md
+*.slurm
+slurm_logs/
+slurm_evals/
+.claude/
+.vscode/
+.env
