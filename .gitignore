@@ -2,6 +2,10 @@ CLAUDE.md
 *.slurm
 slurm_logs/
 slurm_evals/
+slurm_*
 .claude/
 .vscode/
 .env
+*.png
+*.sh
+plots/

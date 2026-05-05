@@ -129,11 +129,23 @@ def compute_continuation_loss(model, tokenizer, prompt_text, continuation_text, 
     return loss, ranks
 
 
+def loss_stats(losses):
+    """Return (mean, std, stderr) for a 1-D loss tensor."""
+    n    = losses.numel()
+    mean = losses.mean().item()
+    std  = losses.std().item()      # Bessel-corrected (ddof=1)
+    se   = std / (n ** 0.5)
+    return mean, std, se
+
+
 def evaluate(model, tokenizer, dataset, device):
-    """Returns (mean_loss, all_ranks) where all_ranks is a 1-D tensor of per-token ranks."""
-    total_loss = 0.0
-    n_valid    = 0
-    all_ranks  = []
+    """Returns (losses, all_ranks) where:
+      losses    : float32 tensor of per-example losses  [N]
+      all_ranks : int64 tensor of per-token ranks       [M]
+    """
+    losses    = []
+    all_ranks = []
+    n_valid   = 0
 
     for i, row in enumerate(dataset):
         prompt = row[args.text_column]
@@ -161,16 +173,17 @@ def evaluate(model, tokenizer, dataset, device):
 
         if loss_val is None:
             continue
-        total_loss += loss_val
-        n_valid    += 1
+        losses.append(loss_val)
+        n_valid += 1
         if ranks.numel():
             all_ranks.append(ranks)
 
         if n_valid % 10 == 0:
-            print(f"  {n_valid}/{len(dataset)}, running loss {total_loss/n_valid:.4f}", flush=True)
+            print(f"  {n_valid}/{len(dataset)}, running loss {sum(losses)/n_valid:.4f}", flush=True)
 
+    losses    = torch.tensor(losses) if losses else torch.empty(0)
     all_ranks = torch.cat(all_ranks) if all_ranks else torch.empty(0, dtype=torch.long)
-    return (total_loss / n_valid if n_valid else float("nan")), all_ranks
+    return losses, all_ranks
 
 
 # ── load tokenizer & model ───────────────────────────────────────────────────
@@ -203,56 +216,57 @@ print(f"Dataset size: {len(dataset)}", flush=True)
 
 # ── evaluate original model ──────────────────────────────────────────────────
 print("\n=== Evaluating ORIGINAL model ===")
-orig_loss, orig_ranks = evaluate(model, tokenizer, dataset, device)
+orig_losses, orig_ranks = evaluate(model, tokenizer, dataset, device)
+orig_mean, orig_std, orig_se = loss_stats(orig_losses)
 orig_rank1 = (orig_ranks == 1).sum().item()
-print(f"Original mean loss : {orig_loss:.4f}")
+print(f"Original mean loss : {orig_mean:.4f} ± {orig_std:.4f}  (SE={orig_se:.4f})")
 print(f"Original rank-1    : {orig_rank1} / {orig_ranks.numel()} tokens "
       f"({100*orig_rank1/max(orig_ranks.numel(),1):.2f}%)", flush=True)
 
 # ── patch ff_out ─────────────────────────────────────────────────────────────
+# Use a forward pre-hook instead of modifying the weight matrix directly.
+# This avoids the meta-tensor error that occurs when device_map="auto" offloads
+# ff_out to CPU and makes ff_out.weight a read-only placeholder.
+#
+# Equivalent projection applied per forward pass:
+#   h_new = h - (h @ U) @ U.T   (i.e. h @ P_perp, but without materializing P_perp)
 print(f"\nLoading subspace from {args.subspace}...")
 subspace = torch.load(args.subspace, weights_only=False)
-P_perp   = subspace["P_perp"].to(torch.bfloat16).to(device)  # [4096, 4096]
+U_basis  = subspace["U"].float()   # [4096, k] orthonormal basis on CPU
 k        = subspace["k"]
 ev       = subspace["explained_variance"]
-print(f"Subspace: k={k}, explained variance={ev:.4f}")
+print(f"Subspace: k={k}, explained variance={ev:.4f}", flush=True)
 
-print("Patching ff_out weight: W_new = W @ P_perp ...", flush=True)
+def _pca_hook(module, inputs):
+    h = inputs[0]                                          # [B, T, 4096]
+    U = U_basis.to(dtype=h.dtype, device=h.device)        # [4096, k]
+    proj = (h @ U) @ U.t()                                # [B, T, 4096]
+    return (h - proj,) + inputs[1:]
+
 ff_out = model.model.transformer.ff_out
-# If device_map="auto" offloaded this layer to CPU/meta, move it to GPU first.
-if ff_out.weight.is_meta or ff_out.weight.device.type == "cpu":
-    ff_out = ff_out.to(device)
-with torch.no_grad():
-    norm_before = ff_out.weight.float().norm().item()
-    patched = ff_out.weight @ P_perp
-    norm_after = patched.float().norm().item()
-    print(f"  ff_out weight norm before: {norm_before:.4f}", flush=True)
-    print(f"  ff_out weight norm after:  {norm_after:.4f}  (ratio={norm_after/norm_before:.4f})", flush=True)
-    if args.renormalize:
-        patched = patched * (norm_before / norm_after)
-        print(f"  Renormalized to original norm ({norm_before:.4f})", flush=True)
-    ff_out.weight.copy_(patched)
-
-del P_perp, subspace, patched
+ff_out.register_forward_pre_hook(_pca_hook)
+print(f"Registered PCA projection hook (k={k}).", flush=True)
+del subspace
 torch.cuda.empty_cache()
 print("Patch applied.")
 
 # ── evaluate patched model ───────────────────────────────────────────────────
 print("\n=== Evaluating PATCHED model ===")
-patched_loss, patched_ranks = evaluate(model, tokenizer, dataset, device)
+patched_losses, patched_ranks = evaluate(model, tokenizer, dataset, device)
+patched_mean, patched_std, patched_se = loss_stats(patched_losses)
 patched_rank1 = (patched_ranks == 1).sum().item()
-print(f"Patched mean loss  : {patched_loss:.4f}")
+print(f"Patched mean loss  : {patched_mean:.4f} ± {patched_std:.4f}  (SE={patched_se:.4f})")
 print(f"Patched rank-1     : {patched_rank1} / {patched_ranks.numel()} tokens "
       f"({100*patched_rank1/max(patched_ranks.numel(),1):.2f}%)", flush=True)
 
 # ── summary ──────────────────────────────────────────────────────────────────
-delta       = patched_loss  - orig_loss
+delta       = patched_mean  - orig_mean
 delta_rank1 = patched_rank1 - orig_rank1
 n_tokens    = orig_ranks.numel()
 
 print(f"\n=== Summary ===")
-print(f"  Original loss  : {orig_loss:.4f}")
-print(f"  Patched  loss  : {patched_loss:.4f}")
+print(f"  Original loss  : {orig_mean:.4f} ± {orig_std:.4f}  (SE={orig_se:.4f})")
+print(f"  Patched  loss  : {patched_mean:.4f} ± {patched_std:.4f}  (SE={patched_se:.4f})")
 print(f"  Δ loss         : {delta:+.4f}  ({'higher = model knows less about forbidden content' if delta > 0 else 'lower'})")
 print(f"  Original rank-1: {orig_rank1} / {n_tokens}  ({100*orig_rank1/max(n_tokens,1):.2f}%)")
 print(f"  Patched  rank-1: {patched_rank1} / {n_tokens}  ({100*patched_rank1/max(n_tokens,1):.2f}%)")
@@ -261,8 +275,14 @@ print(f"  Mean rank (orig)   : {orig_ranks.float().mean().item():.1f}")
 print(f"  Mean rank (patched): {patched_ranks.float().mean().item():.1f}")
 
 torch.save({
-    "original_loss":    orig_loss,
-    "patched_loss":     patched_loss,
+    "orig_losses":      orig_losses,
+    "patched_losses":   patched_losses,
+    "orig_mean":        orig_mean,
+    "patched_mean":     patched_mean,
+    "orig_std":         orig_std,
+    "patched_std":      patched_std,
+    "orig_se":          orig_se,
+    "patched_se":       patched_se,
     "delta":            delta,
     "orig_ranks":       orig_ranks,
     "patched_ranks":    patched_ranks,
